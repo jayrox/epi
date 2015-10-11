@@ -1,144 +1,187 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
-	"gopkg.in/xmlpath.v2"
+	"io"
 	"io/ioutil"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/xmlpath.v2"
 )
 
-// http://thetvdb.com/wiki/index.php?title=Programmers_API
-var api_key = "your thetvdb api key"
-
-var flagdir = flag.String("dir", "./", "directory to scan")
-var flagminsize = flag.Int64("min", 3000000, "directory to scan") // 3MB
-var flaglanguage = flag.String("l", "en", "language")             // en
-var flagseasonzero = flag.Bool("s", false, "include season zero (specials, etc)")
-var flagepisodezero = flag.Bool("e", false, "include episode zero (specials, etc)")
-var flagignore = flag.String("i", "", "comma seperated list of show titles to ignore, please wrap in double quotes (\")")
-var flagdebug = flag.Bool("d", false, "show debug output")
-var flagfuture = flag.Int64("f", 365, "how many days into the future to include in the report - default is 365")
-var flagpast = flag.Int64("p", -1, "how many days into the past to include in the report - default is infinite")
-var flagtba = flag.Bool("t", false, "include episodes with a TBA (to be announced) air date")
-
-var EF EpiFlags
+var (
+	project            = "epi"
+	apiKey             = "your thetvdb api key"
+	flagdir            = flag.String("dir", "cwd", "directory to scan. default is current working directory (cwd)")
+	flagminsize        = flag.Int64("min", 3000000, "minimum file size to include in scan. default is 3MB") // 3MB
+	flaglanguage       = flag.String("l", "en", "language")                                                 // en
+	flagseasonzero     = flag.Bool("s", false, "include season zero (specials, etc)")
+	flagepisodezero    = flag.Bool("e", false, "include episode zero (specials, etc)")
+	flagignore         = flag.String("i", "", "comma seperated list of show titles to ignore, please wrap in double quotes (\")")
+	flagdebug          = flag.Bool("d", false, "show debug output")
+	flagfuture         = flag.Int64("f", 365, "how many days into the future to include in the report. default is 365")
+	flagpast           = flag.Int64("p", -1, "how many days into the past to include in the report. default is infinite")
+	flagtba            = flag.Bool("t", false, "include episodes with a TBA (to be announced) air date")
+	flagairdate        = flag.Bool("sa", false, "sort by air date (oldest to newest)")
+	flagairdatereverse = flag.Bool("sar", false, "sort by air date (newest to oldest)")
+	ef                 epiFlags
+)
 
 func main() {
 	flag.Parse()
 	// Print the logo :P
-	PrintLogo()
+	printLogo()
 
 	// Root folder to scan
-	EF.Dir = FlagString(flagdir)
-	fmt.Printf("Scanning directory: %s\n", EF.Dir)
+	ef.Dir = flagString(flagdir)
+	if ef.Dir == "cwd" {
+		dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+		if err != nil {
+			log.Fatal(err)
+		}
+		ef.Dir = dir
+	}
+	fmt.Printf("Scanning directory: %s\n", ef.Dir)
 
 	// Min file size to parse
 	// default is 3,000,000 bytes
-	EF.Min = FlagInt(flagminsize)
-	PrintDebug("Min: %d\n", EF.Min)
+	ef.Min = flagInt(flagminsize)
+	printDebug("Min: %d\n", ef.Min)
 
 	// Language to use when parsing
 	// default is en
-	EF.Language = FlagString(flaglanguage)
-	fmt.Printf("Language: %+v\n", EF.Language)
+	ef.Language = flagString(flaglanguage)
+	fmt.Printf("Language: %+v\n", ef.Language)
 
 	// Include Season "0" typically these are specials
-	EF.SeasonZero = FlagBool(flagseasonzero)
+	ef.SeasonZero = flagBool(flagseasonzero)
 
 	// Include Episode "0" typically these are specials
-	EF.EpisodeZero = FlagBool(flagepisodezero)
+	ef.EpisodeZero = flagBool(flagepisodezero)
 
 	// Get list of show titles to ignore
-	EF.Ignore = Normalize(FlagString(flagignore))
-	PrintDebug("ignored shows: %s\n", EF.Ignore)
+	ef.Ignore = normalize(flagString(flagignore))
+	printDebug("Ignored shows: %s\n", ef.Ignore)
 
 	// Get number of days into the future to include in the report
 	// default is 365
-	EF.Future = FlagInt(flagfuture)
+	ef.Future = flagInt(flagfuture)
 
 	// Get number of days into the past to include in the report
 	// default is infinite
-	EF.Past = FlagInt(flagpast)
+	ef.Past = flagInt(flagpast)
 
 	// Include episodes with a TBA (to be announced) air date
-	EF.TBA = FlagBool(flagtba)
+	ef.TBA = flagBool(flagtba)
+
+	// Sort by Air Date
+	ef.SortAirDate = flagBool(flagairdate)
+
+	// Sort by Air Date Reverse
+	ef.SortAirDateReverse = flagBool(flagairdatereverse)
 
 	// Get thetvdb.com mirror for season/episode data
-	mirrorsurl := "http://thetvdb.com/api/" + api_key + "/mirrors.xml"
-	EF.Mirror = GetMirrors(mirrorsurl)
-	PrintDebug("Mirror: %s\n", EF.Mirror)
+	mirrorsurl := "http://thetvdb.com/api/" + apiKey + "/mirrors.xml"
+	ef.Mirror = getMirrors(mirrorsurl)
+	printDebug("Mirror: %s\n", ef.Mirror)
 
 	// Below this line is missing episode data
-	fmt.Println("______________________________________")
+	fmt.Println("__________________________________")
 
 	// Holder of episode data
-	episodes := []Episode{}
+	episodes := episodes{}
 
 	// Files listed under the root directory
-	files, _ := FolderFiles(EF.Dir)
+	files, _ := folderFiles(ef.Dir)
 
 	// 	Expected dirctory structure: Show Name/Season ##/Show Name - S##E## - Episode Title.ext
-	episodes = FolderWalk(files, episodes)
-	PrintReport(episodes, EF)
+	episodes = folderWalk(files, episodes)
+
+	// Sort Episodes by Air Date (oldest to newest)
+	if ef.SortAirDate {
+		sort.Sort(episodes)
+	}
+
+	// Sort Episodes by Air Date Reverse (newest to oldest)
+	if ef.SortAirDateReverse {
+		sort.Sort(sort.Reverse(episodes))
+	}
+
+	// Print a seperator line if debugging is enabled.
+	printDebug("__________________________________", nil)
+
+	// Print report
+	printReport(episodes, ef)
 }
 
 // Hold flag data
-type EpiFlags struct {
-	Mirror string
-	Dir string
-	Min int64
-	Language string
-	SeasonZero bool
-	EpisodeZero bool
-	Ignore string
-	Future int64
-	Past int64
-	TBA bool
-	Debug bool
+type epiFlags struct {
+	Mirror             string
+	Dir                string
+	Min                int64
+	Language           string
+	SeasonZero         bool
+	EpisodeZero        bool
+	Ignore             string
+	Future             int64
+	Past               int64
+	TBA                bool
+	SortAirDate        bool
+	SortAirDateReverse bool
+	Debug              bool
 }
 
-func FlagString(fs *string) string {
+func flagString(fs *string) string {
 	return fmt.Sprint(*fs)
 }
 
-func FlagInt(fi *int64) int64 {
+func flagInt(fi *int64) int64 {
 	return int64(*fi)
 }
 
-func FlagBool(fb *bool) bool {
+func flagBool(fb *bool) bool {
 	return bool(*fb)
 }
 
 // Get list of files from the folder
-func FolderFiles(dir string) (files []os.FileInfo, err error) {
-	files, err = ioutil.ReadDir(dir)
+func folderFiles(path string) (files []os.FileInfo, err error) {
+	files, err = ioutil.ReadDir(path)
 	if err != nil {
 		ep := err.(*os.PathError)
-		fmt.Printf("Error: Invalid directory - %s\n", ep.Path)
+		printDebug("Error: Invalid directory - %s\n", ep.Path)
 		return nil, err
 	}
 	return files, nil
 }
 
+func isDirectory(path string) (bool, error) {
+	fileInfo, err := os.Stat(path)
+	return fileInfo.IsDir(), err
+}
+
 // Walk the list of files
-func FolderWalk(files []os.FileInfo, episodes []Episode) []Episode{
+func folderWalk(files []os.FileInfo, episodes []episode) []episode {
 	for _, f := range files {
 		showname := f.Name()
-		PrintDebug("%+v\n", showname)
-		if IgnoreShow(EF.Ignore, showname) {
-			PrintDebug("Ignoring: %s\n", showname)
+		printDebug("%+v\n", showname)
+		if ignoreShow(ef.Ignore, showname) {
+			printDebug("Ignoring: %s\n", showname)
 			continue
 		}
-		showdir := EF.Dir + "\\" + showname
-		seasons, _ := FolderFiles(showdir)
+		showdir := ef.Dir + "\\" + showname
+		seasons, _ := folderFiles(showdir)
 		seriesname := ""
 		seriesid := ""
 		for _, season := range seasons {
@@ -149,37 +192,45 @@ func FolderWalk(files []os.FileInfo, episodes []Episode) []Episode{
 				continue
 			}
 
-			PrintDebug("* %+v\n", season.Name())
+			printDebug("* %+v\n", season.Name())
 			seasondir := showdir + "\\" + season.Name()
-			epis, _ := FolderFiles(seasondir)
+			epis, _ := folderFiles(seasondir)
 			for _, episode := range epis {
-				if episode.Size() < EF.Min {
+				if episode.Size() < ef.Min {
 					continue
 				}
-				name := GetName(episode.Name())
-				if IgnoreShow(EF.Ignore, Normalize(name)) {
-					PrintDebug("Ignoring: %s\n", name)
+				name := getName(episode.Name())
+				if ignoreShow(ef.Ignore, normalize(name)) {
+					printDebug("Ignoring: %s\n", name)
 					continue
 				}
-				if seriesname != Normalize(name) {
-					seriesid = GetSeries(name, EF.Mirror, EF.Language, api_key)
+				if seriesname != normalize(name) {
+					seriesid = getSeries(name, ef.Mirror, ef.Language)
 					if seriesid == "nil" {
 						fmt.Printf("Error: Unable to find %s\n", name)
 						continue
 					}
-					seriesname = Normalize(name)
+					seriesname = normalize(name)
 
-					PrintDebug("series name: %s\n", seriesname)
-					PrintDebug("* * * Series ID: %s\n", seriesid)
-					episodes = GetSeriesInfo(name, seriesid, EF.Mirror, EF.Language, api_key, episodes)
+					printDebug("series name: %s\n", seriesname)
+					printDebug("* * * Series ID: %s\n", seriesid)
+					episodes = getSeriesInfo(name, seriesid, ef.Mirror, ef.Language, episodes)
 				}
 
-				seasonnum := GetSeason(episode.Name())
-				PrintDebug("* * * season: %d\n", seasonnum)
+				seasonnum := getSeason(episode.Name())
+				printDebug("* * * season: %d\n", seasonnum)
 
-				episodenum := GetEpisode(episode.Name())
-				PrintDebug("* * * episode: %d\n", episodenum)
-				MarkHave(episodes, Normalize(name), seasonnum, episodenum)
+				index := 0
+				loop := true
+				for loop == true {
+					episodenum, matches := getEpisode(episode.Name(), index)
+					if episodenum == -1 || ((matches - 1) == index) {
+						loop = false
+					}
+					printDebug("* * * episode: %d\n", episodenum)
+					markHave(episodes, normalize(name), seasonnum, episodenum)
+					index = index + 1
+				}
 			}
 		}
 	}
@@ -187,7 +238,7 @@ func FolderWalk(files []os.FileInfo, episodes []Episode) []Episode{
 }
 
 // Get show name from string
-func GetName(s string) (name string) {
+func getName(s string) (name string) {
 	re, _ := regexp.Compile(`(^[a-zA-Z0-9'\.&() ]*)`)
 	match := re.FindStringSubmatch(s)
 	if len(match) != 0 {
@@ -198,11 +249,11 @@ func GetName(s string) (name string) {
 }
 
 // Get season number from string
-func GetSeason(s string) (season int64) {
+func getSeason(s string) (season int64) {
 	re, _ := regexp.Compile(`(S[0-9]{2})`)
 	match := re.FindStringSubmatch(s)
 	if len(match) != 0 {
-		season, err := strconv.ParseInt(strings.TrimLeft(match[1], "S"), 10, 0)
+		season, err := strconv.ParseInt(strings.TrimLeft(match[1], "sS"), 10, 0)
 		if err != nil {
 			fmt.Println(err)
 		}
@@ -212,20 +263,24 @@ func GetSeason(s string) (season int64) {
 }
 
 // Get episode number from string
-func GetEpisode(s string) (episode int64) {
-	re, _ := regexp.Compile(`(E[0-9]{2})`)
-	match := re.FindStringSubmatch(s)
-	if len(match) != 0 {
-		episode, err := strconv.ParseInt(strings.TrimLeft(match[1], "E"), 10, 0)
+func getEpisode(s string, index int) (episode int64, matches int) {
+	re, _ := regexp.Compile(`(?i)(E[\d]{1,2})`)
+	match := re.FindAllString(s, -1)
+	matches = len(match)
+	if matches != 0 {
+		if index > (matches - 1) {
+			return -1, matches
+		}
+		episode, err := strconv.ParseInt(strings.TrimLeft(match[index], "eE"), 10, 0)
 		if err != nil {
 			fmt.Println(err)
 		}
-		return episode
+		return episode, matches
 	}
-	return 0
+	return -1, matches
 }
 
-func GetMirrors(url string) string {
+func getMirrors(url string) string {
 	response, err := http.Get(url)
 	if err != nil {
 		fmt.Printf("%s", err)
@@ -244,65 +299,116 @@ func GetMirrors(url string) string {
 	return ""
 }
 
-func GetSeries(series, mirror, language, api_key string) string {
-	url := mirror + "/api/GetSeries.php?seriesname=" + url.QueryEscape(series) + "&language=" + language
-	PrintDebug("%s\n", url)
-	response, err := http.Get(url)
-	if err != nil {
-		fmt.Printf("%s", err)
-		os.Exit(1)
-	} else {
-		defer response.Body.Close()
-		path := xmlpath.MustCompile("/Data/Series/seriesid")
-		root, err := xmlpath.Parse(response.Body)
+func getURLorCache(fileName, url string) io.Reader {
+	// Check Cache Folder; create if does not exist
+	ok, err := exists("epi_cache")
+	if ok == false || err != nil {
+		os.MkdirAll("."+string(filepath.Separator)+"epi_cache", 0777)
+	}
+	var s []byte
+
+	// Check if Cache File exists; if not get from web, store in cache
+	ok, err = exists(fileName)
+	if ok == false || err != nil {
+		printDebug("getting from url: %s\n", url)
+		response, err := http.Get(url)
 		if err != nil {
-			fmt.Println("Error: ", err)
+			fmt.Printf("%s", err)
+			os.Exit(1)
+		} else {
+			defer response.Body.Close()
 		}
-		if value, ok := path.String(root); ok {
-			return value
+
+		// Convert to byte and write
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(response.Body)
+		s = buf.Bytes()
+		err = ioutil.WriteFile(fileName, s, 0644)
+		if err != nil {
+			fmt.Println(err)
 		}
+	} else {
+		// Cache exists, read and return
+		printDebug("reading file: %s\n", fileName)
+		s, err = ioutil.ReadFile(fileName)
+		if err != nil {
+			fmt.Println(err)
+		}
+	}
+
+	return bytes.NewReader(s)
+}
+
+func getSeries(series, mirror, language string) string {
+	// Cache file name
+	fileName := fmt.Sprintf("epi_cache/%s_%s.xml", language, normalize(series))
+	url := mirror + "/api/GetSeries.php?seriesname=" + url.QueryEscape(series) + "&language=" + language
+
+	// Get XML data from file if exists or from URL
+	xml := getURLorCache(fileName, url)
+
+	// Parse XML data
+	root, err := xmlpath.Parse(xml)
+	if err != nil {
+		fmt.Println("Error: ", err)
+	}
+	path := xmlpath.MustCompile("/Data/Series/seriesid")
+	if value, ok := path.String(root); ok {
+		return value
 	}
 	return "nil"
 }
 
-func GetSeriesInfo(seriesname, seriesid, mirror, language, api_key string, episodes []Episode) []Episode {
-	url := mirror + "/api/" + api_key + "/series/" + seriesid + "/all/" + language + ".xml"
-	PrintDebug("%s\n", url)
-	response, err := http.Get(url)
+func getSeriesInfo(seriesname, seriesid, mirror, language string, episodes []episode) []episode {
+	// Cache file name
+	fileName := fmt.Sprintf("epi_cache/%s_%s_%s.xml", language, normalize(seriesname), seriesid)
+	url := mirror + "/api/" + apiKey + "/series/" + seriesid + "/all/" + language + ".xml"
+
+	// Get XML data from file if exists or from URL
+	xml := getURLorCache(fileName, url)
+
+	// Parse XML data
+	root, err := xmlpath.Parse(xml)
 	if err != nil {
-		fmt.Printf("%s", err)
-		os.Exit(1)
-	} else {
-		defer response.Body.Close()
-		path := xmlpath.MustCompile("/Data/Episode")
-		root, err := xmlpath.Parse(response.Body)
-		if err != nil {
-			fmt.Println("Error: ", err)
+		fmt.Println("Error: ", err)
+	}
+	spath := xmlpath.MustCompile("/Data/Series/Airs_Time")
+	airtime, ok := spath.String(root)
+	if !ok {
+		printDebug("AirTime not defined\n", "")
+	}
+
+	path := xmlpath.MustCompile("/Data/Episode")
+	iterator := path.Iter(root)
+	for iterator.Next() {
+		line := iterator.Node()
+
+		s := getXpathInt("SeasonNumber", line)
+		e := getXpathInt("EpisodeNumber", line)
+		t := getXpathString("EpisodeName", line)
+		// if the episode name is blank, set to TBA (to be announced)
+		if t == "" {
+			t = "TBA"
 		}
-		iterator := path.Iter(root)
-		for iterator.Next() {
-			line := iterator.Node()
-
-			s := getXpathInt("SeasonNumber", line)
-			e := getXpathInt("EpisodeNumber", line)
-			t := getXpathString("EpisodeName", line)
-			// if the episode name is blank, set to TBA (to be announced)
-			if t == "" {
-				t = "TBA"
-			}
-			a := getXpathString("FirstAired", line)
-			// if the air date is blank, set to TBA (to be announced)
-			if a == "" {
-				a = "TBA"
-			}
-
-			nname := Normalize(seriesname)
-
-			episode := Episode{Name: seriesname, NormalizedName: nname, Title: t, Season: s, Episode: e, AirDate: a, Have: false}
-			episodes = append(episodes, episode)
+		a := getXpathString("FirstAired", line)
+		// if the air date is blank, set to TBA (to be announced)
+		if a == "" {
+			a = "TBA"
 		}
-		return episodes
 
+		nname := normalize(seriesname)
+
+		episode := episode{
+			Name:           seriesname,
+			NormalizedName: nname,
+			Title:          t,
+			Season:         s,
+			Episode:        e,
+			AirDate:        a,
+			AirTime:        airtime,
+			Have:           false,
+		}
+		episodes = append(episodes, episode)
 	}
 	return episodes
 }
@@ -326,95 +432,155 @@ func getXpathInt(xpath string, node *xmlpath.Node) int64 {
 }
 
 // Mark the episode meta data as have
-func MarkHave (episodes []Episode, show string, season, episode int64) []Episode {
-	PrintDebug("* * * marking: %s - %d %d", show, season, episode)
+func markHave(episodes []episode, show string, season, episode int64) []episode {
+	printDebug("* * * marking: %s - %d %d", show, season, episode)
 	for i, v := range episodes {
 		if v.NormalizedName == show {
 			if v.Season == season {
 				if v.Episode == episode {
 					episodes[i].Have = true
-					PrintDebug(" - marked")
+					printDebug(" - marked", nil)
 				}
 			}
 		}
 	}
-	PrintDebug("\n")
+	printDebug("", nil)
 	return episodes
 }
 
 // Holder of Episode data
-type Episode struct {
-	Name string
+type episode struct {
+	Name           string
 	NormalizedName string
-	Title string
-	Season int64
-	Episode int64
-	AirDate string
-	Have bool
+	Title          string
+	Season         int64
+	Episode        int64
+	AirDate        string
+	AirTime        string
+	Have           bool
+}
+
+type episodes []episode
+
+func (slice episodes) Len() int {
+	return len(slice)
+}
+
+func (slice episodes) Less(i, j int) bool {
+	return slice[i].AirDate < slice[j].AirDate
+}
+
+func (slice episodes) Swap(i, j int) {
+	slice[i], slice[j] = slice[j], slice[i]
+}
+
+type episodesByName []episode
+
+func (slice episodesByName) Len() int {
+	return len(slice)
+}
+
+func (slice episodesByName) Less(i, j int) bool {
+	return slice[i].Name < slice[j].Name
+}
+
+func (slice episodesByName) Swap(i, j int) {
+	slice[i], slice[j] = slice[j], slice[i]
 }
 
 // Normalize a string to lowercase, strip spaces, remove single and double quotes and periods
-func Normalize(s string) string {
+func normalize(s string) string {
 	s = strings.ToLower(s)
-	s = strings.Replace(s, " ", "" , -1)
+	s = strings.Replace(s, " ", "", -1)
 	s = strings.Replace(s, "'", "", -1)
 	s = strings.Replace(s, "\"", "", -1)
 	s = strings.Replace(s, ".", "", -1)
 	return s
 }
 
-func PrintReport(episodes []Episode, EF EpiFlags) {
+func countHaves(episodes []episode) (total, haves, missing int64) {
+	haves = 0
+	total = 0
+	missing = 0
 	for _, v := range episodes {
-		if ! v.Have {
+		if v.Have {
+			haves = haves + 1
+		} else {
+			missing = missing + 1
+		}
+
+		total = total + 1
+	}
+	return total, haves, missing
+}
+
+func printReport(episodes []episode, ef epiFlags) {
+	if len(episodes) == 0 {
+		fmt.Println("No episodes found.")
+		return
+	}
+
+	t, h, m := countHaves(episodes)
+	fmt.Printf("Total Episodes: %d\n", t)
+	fmt.Printf("Episodes in Library: %d\n", h)
+	fmt.Printf("Missing Episodes: %d\n", m)
+	fmt.Println("__________________________________")
+
+	for _, v := range episodes {
+		if !v.Have {
 			// if the season number is 0 and the skip season zero is true, skip
-			if v.Season == 0 && ! EF.SeasonZero {
+			if v.Season == 0 && !ef.SeasonZero {
 				continue
 			}
 
 			// if the episode number is 0 and skip episode zero is true, skip
-			if v.Episode == 0 && ! EF.EpisodeZero {
+			if v.Episode == 0 && !ef.EpisodeZero {
 				continue
 			}
 
 			// if include episodes with TBA air date is false and the air date is false, skip
-			if ! EF.TBA && v.AirDate == "TBA" {
+			if !ef.TBA && v.AirDate == "TBA" {
 				continue
 			}
 
 			// if the past limit is set (> -1) and the air date is > than the past limit in days, skip
-			if TimeSince(v.AirDate) > EF.Past && EF.Past > -1 {
+			if timeSince(v.AirDate) > ef.Past && ef.Past > -1 {
 				continue
 			}
 
 			// if the future limit is set (> -1) and the air date is > than the future limit in days, skip
-			if TimeUntil(v.AirDate) > EF.Future && EF.Future > -1 {
+			if timeUntil(v.AirDate) > ef.Future && ef.Future > -1 {
 				continue
 			}
-			fmt.Printf("%s - S%02dE%02d - %s -- %s\n", v.Name, v.Season, v.Episode, v.Title, v.AirDate)
+			fmt.Printf("%s - S%02dE%02d - %s -- %s @ %s\n", v.Name, v.Season, v.Episode, v.Title, v.AirDate, v.AirTime)
 		}
 	}
 }
 
 // Only print debug output if the debug flag is true
-func PrintDebug(format string, vars ...interface{}) {
+func printDebug(format string, vars ...interface{}) {
 	if *flagdebug {
+		if vars[0] == nil {
+			fmt.Println(format)
+			return
+		}
 		fmt.Printf(format, vars...)
 	}
 }
 
 // Only include episodes if the show name is not set to be ignored
-func IgnoreShow(ignoredshows, showname string) bool {
-	normalizedshowname := Normalize(showname)
-	PrintDebug("Ignore - %s:%s\n", ignoredshows, normalizedshowname)
+func ignoreShow(ignoredshows, showname string) bool {
+	normalizedshowname := normalize(showname)
+	printDebug("Ignore - %s:%s\n", ignoredshows, normalizedshowname)
 	if strings.Contains(ignoredshows, normalizedshowname) {
-		PrintDebug("Ignoring: %s\n", normalizedshowname)
+		printDebug("Ignoring: %s\n", normalizedshowname)
 		return true
 	}
 	return false
 }
 
 // Print the logo, obviously
-func PrintLogo() {
+func printLogo() {
 	fmt.Println("███████╗██████╗ ██╗")
 	fmt.Println("██╔════╝██╔══██╗╚═╝")
 	fmt.Println("█████╗  ██████╔╝██╗")
@@ -425,30 +591,42 @@ func PrintLogo() {
 }
 
 const (
-    // See http://golang.org/pkg/time/#Parse
-    timeFormat = "2006-01-02"
+	// See http://golang.org/pkg/time/#Parse
+	timeFormat = "2006-01-02"
 )
 
 // Time since now
-func TimeSince(d string) int64 {
+func timeSince(d string) int64 {
 	if d == "" {
 		return -1
 	}
 	then, err := time.Parse(timeFormat, d)
-    if err != nil {
-        fmt.Println("Err: ", err)
-        return -1
-    }
-    duration := time.Since(then)
-    return int64(Round(duration.Hours() / 24))
+	if err != nil {
+		fmt.Println("Err: ", err)
+		return -1
+	}
+	duration := time.Since(then)
+	return int64(round(duration.Hours() / 24))
 }
 
 // Inverse of time since now
-func TimeUntil(d string) int64 {
-	return -TimeSince(d)
+func timeUntil(d string) int64 {
+	return -timeSince(d)
 }
 
 // Round the floats
-func Round(f float64) float64 {
-    return math.Floor(f + .5)
+func round(f float64) float64 {
+	return math.Floor(f + .5)
+}
+
+// exists returns whether the given file or directory exists or not
+func exists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return true, err
 }
